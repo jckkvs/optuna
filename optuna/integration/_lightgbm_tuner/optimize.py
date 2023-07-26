@@ -301,7 +301,13 @@ class _OptunaObjectiveCV(_OptunaObjective):
 
     def _get_cv_scores(self, cv_results: Dict[str, List[float]]) -> List[float]:
         metric = self._get_metric_for_objective()
-        val_scores = cv_results["{}-mean".format(metric)]
+        metric_key = f"{metric}-mean"
+        # The prefix "valid " is added to metric name since LightGBM v4.0.0.
+        val_scores = (
+            cv_results[metric_key]
+            if metric_key in cv_results
+            else cv_results["valid " + metric_key]
+        )
         return val_scores
 
     def __call__(self, trial: optuna.trial.Trial) -> float:
@@ -347,6 +353,7 @@ class _LightGBMBaseTuner(_BaseTuner):
         self,
         params: Dict[str, Any],
         train_set: "lgb.Dataset",
+        callbacks: List[Callable[..., Any]],
         num_boost_round: int = 1000,
         fobj: Optional[Callable[..., Any]] = None,
         feval: Optional[Callable[..., Any]] = None,
@@ -354,7 +361,6 @@ class _LightGBMBaseTuner(_BaseTuner):
         categorical_feature: str = "auto",
         early_stopping_rounds: Optional[int] = None,
         verbose_eval: Optional[Union[bool, int, str]] = None,
-        callbacks: Optional[List[Callable[..., Any]]] = None,
         time_budget: Optional[int] = None,
         sample_size: Optional[int] = None,
         study: Optional[optuna.study.Study] = None,
@@ -368,19 +374,32 @@ class _LightGBMBaseTuner(_BaseTuner):
         _imports.check()
 
         params = copy.deepcopy(params)
+        if fobj is not None:
+            if "objective" not in params:
+                params["objective"] = fobj
+            else:
+                warnings.warn(
+                    "Objective function is specified by param['objective'] and therefore `fobj`"
+                    " will be ignored.",
+                    UserWarning,
+                )
 
         # Handling alias metrics.
         _handling_alias_metrics(params)
 
+        if early_stopping_rounds is not None:
+            callbacks.append(
+                lgb.early_stopping(
+                    stopping_rounds=early_stopping_rounds, verbose=bool(verbose_eval)
+                )
+            )
+
         args = [params, train_set]
         kwargs: Dict[str, Any] = dict(
             num_boost_round=num_boost_round,
-            fobj=fobj,
             feval=feval,
             feature_name=feature_name,
             categorical_feature=categorical_feature,
-            early_stopping_rounds=early_stopping_rounds,
-            verbose_eval=verbose_eval,
             callbacks=callbacks,
             time_budget=time_budget,
             sample_size=sample_size,
@@ -557,7 +576,7 @@ class _LightGBMBaseTuner(_BaseTuner):
         param_name = "feature_fraction"
         param_values = np.linspace(0.4, 1.0, n_trials).tolist()
 
-        sampler = optuna.samplers.GridSampler({param_name: param_values})
+        sampler = optuna.samplers.GridSampler({param_name: param_values}, seed=self._optuna_seed)
         self._tune_params([param_name], len(param_values), sampler, "feature_fraction")
 
     def tune_num_leaves(self, n_trials: int = 20) -> None:
@@ -584,7 +603,7 @@ class _LightGBMBaseTuner(_BaseTuner):
         ).tolist()
         param_values = [val for val in param_values if val >= 0.4 and val <= 1.0]
 
-        sampler = optuna.samplers.GridSampler({param_name: param_values})
+        sampler = optuna.samplers.GridSampler({param_name: param_values}, seed=self._optuna_seed)
         self._tune_params([param_name], len(param_values), sampler, "feature_fraction_stage2")
 
     def tune_regularization_factors(self, n_trials: int = 20) -> None:
@@ -599,7 +618,7 @@ class _LightGBMBaseTuner(_BaseTuner):
         param_name = "min_child_samples"
         param_values = [5, 10, 25, 50, 100]
 
-        sampler = optuna.samplers.GridSampler({param_name: param_values})
+        sampler = optuna.samplers.GridSampler({param_name: param_values}, seed=self._optuna_seed)
         self._tune_params([param_name], len(param_values), sampler, "min_data_in_leaf")
 
     def _tune_params(
@@ -814,9 +833,26 @@ class LightGBMTuner(_LightGBMBaseTuner):
         *,
         optuna_seed: Optional[int] = None,
     ) -> None:
+        if callbacks is None:
+            callbacks = []
+
+        if evals_result is not None:
+            callbacks.append(lgb.record_evaluation(evals_result))
+
+        if learning_rates is not None:
+            callbacks.append(lgb.reset_parameter(learning_rate=learning_rates))
+
+        if verbose_eval == "warn":
+            verbose_eval = False if callbacks else True
+        if verbose_eval is True:
+            callbacks.append(lgb.log_evaluation())
+        elif isinstance(verbose_eval, int):
+            callbacks.append(lgb.log_evaluation(verbose_eval))
+
         super().__init__(
             params,
             train_set,
+            callbacks=callbacks,
             num_boost_round=num_boost_round,
             fobj=fobj,
             feval=feval,
@@ -824,7 +860,6 @@ class LightGBMTuner(_LightGBMBaseTuner):
             categorical_feature=categorical_feature,
             early_stopping_rounds=early_stopping_rounds,
             verbose_eval=verbose_eval,
-            callbacks=callbacks,
             time_budget=time_budget,
             sample_size=sample_size,
             study=study,
@@ -837,8 +872,6 @@ class LightGBMTuner(_LightGBMBaseTuner):
 
         self.lgbm_kwargs["valid_sets"] = valid_sets
         self.lgbm_kwargs["valid_names"] = valid_names
-        self.lgbm_kwargs["evals_result"] = evals_result
-        self.lgbm_kwargs["learning_rates"] = learning_rates
         self.lgbm_kwargs["keep_training_booster"] = keep_training_booster
 
         self._best_booster_with_trial_number: Optional[Tuple[lgb.Booster, int]] = None
@@ -980,17 +1013,25 @@ class LightGBMTunerCV(_LightGBMBaseTuner):
         *,
         optuna_seed: Optional[int] = None,
     ) -> None:
+        if callbacks is None:
+            callbacks = []
+
+        if verbose_eval is True:
+            callbacks.append(lgb.log_evaluation(show_stdv=show_stdv))
+        elif isinstance(verbose_eval, int):
+            callbacks.append(lgb.log_evaluation(period=verbose_eval, show_stdv=show_stdv))
+
         super().__init__(
             params,
             train_set,
-            num_boost_round,
+            callbacks=callbacks,
+            num_boost_round=num_boost_round,
             fobj=fobj,
             feval=feval,
             feature_name=feature_name,
             categorical_feature=categorical_feature,
             early_stopping_rounds=early_stopping_rounds,
             verbose_eval=verbose_eval,
-            callbacks=callbacks,
             time_budget=time_budget,
             sample_size=sample_size,
             study=study,
@@ -1005,7 +1046,6 @@ class LightGBMTunerCV(_LightGBMBaseTuner):
         self.lgbm_kwargs["nfold"] = nfold
         self.lgbm_kwargs["stratified"] = stratified
         self.lgbm_kwargs["shuffle"] = shuffle
-        self.lgbm_kwargs["show_stdv"] = show_stdv
         self.lgbm_kwargs["seed"] = seed
         self.lgbm_kwargs["fpreproc"] = fpreproc
         self.lgbm_kwargs["return_cvbooster"] = return_cvbooster
